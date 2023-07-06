@@ -34,12 +34,13 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+
+      // char *pa = kalloc();
+      // if(pa == 0)
+      //   panic("kalloc");
+      // uint64 va = KSTACK((int) (p - proc));
+      // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      // p->kstack = va;
   }
   kvminithart();
 }
@@ -113,6 +114,7 @@ found:
     return 0;
   }
 
+
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -120,6 +122,24 @@ found:
     release(&p->lock);
     return 0;
   }
+
+  // Kernel page table.
+  p->proc_kernel_pagetable = ukvminit();
+    if(p->proc_kernel_pagetable == 0){
+      freeproc(p);
+      release(&p->lock);
+      return 0;
+  }
+
+  //proc_kernel_pagetable Init
+
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int) (p - proc));
+  ukvmmap(p->proc_kernel_pagetable,va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -130,6 +150,28 @@ found:
   return p;
 }
 
+
+
+void 
+proc_freekernelpagetable(pagetable_t pagetable){
+  for (int i = 0; i < 512; ++i) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V)) {
+      pagetable[i] = 0;
+      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+        uint64 child = PTE2PA(pte);
+        proc_freekernelpagetable((pagetable_t)child);
+      }
+    } else if (pte & PTE_V) {
+      panic("proc free kernelpagetable : leaf");
+    }
+  }
+  kfree((void*)pagetable);
+}
+
+
+
+
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
@@ -139,8 +181,25 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+
+  // 删除内核栈
+  if (p->kstack) {
+    // 通过页表地址， kstack虚拟地址 找到最后一级的页表项
+    pte_t* pte = walk(p->proc_kernel_pagetable, p->kstack, 0);
+    if (pte == 0)
+      panic("freeproc : kstack");
+    // 删除页表项对应的物理地址
+    kfree((void*)PTE2PA(*pte));
+  }
+  p->kstack = 0;
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+
+  // 删除kernel pagetable
+  if (p->proc_kernel_pagetable) 
+    proc_freekernelpagetable(p->proc_kernel_pagetable);
+
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -221,6 +280,8 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+ uvmcopy_not_physical(p->pagetable, p->proc_kernel_pagetable, 0, p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -235,6 +296,23 @@ userinit(void)
 
 // Grow or shrink user memory by n bytes.
 // Return 0 on success, -1 on failure.
+// int
+// growproc(int n)
+// {
+//   uint sz;
+//   struct proc *p = myproc();
+
+//   sz = p->sz;
+//   if(n > 0){
+//     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+//       return -1;
+//     }
+//   } else if(n < 0){
+//     sz = uvmdealloc(p->pagetable, sz, sz + n);
+//   }
+//   p->sz = sz;
+//   return 0;
+// }
 int
 growproc(int n)
 {
@@ -243,15 +321,28 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    if(PGROUNDDOWN(sz + n) >= PLIC)
+      return -1;
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    uvmcopy_not_physical(p->pagetable, p->proc_kernel_pagetable, p->sz, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+	
+	// 缩小 kernel_pagetable 的相应映射
+    int newsz = p->sz + n;
+    if(PGROUNDDOWN(newsz) < PGROUNDUP(p->sz))
+    {
+      int npages = (PGROUNDUP(p->sz) - PGROUNDUP(newsz)) / PGSIZE;
+      uvmunmap(p->proc_kernel_pagetable, PGROUNDUP(newsz), npages, 0);
+    }
+
   }
   p->sz = sz;
   return 0;
 }
+
 
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
@@ -268,7 +359,7 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0 || uvmcopy_not_physical(np->pagetable, np->proc_kernel_pagetable, 0, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
@@ -473,8 +564,16 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        //在切换任务前，将用户内核页表替换到stap寄存器中
+        w_satp(MAKE_SATP(p->proc_kernel_pagetable));
+        // 清除快表缓存
+        sfence_vma();
+
+
         swtch(&c->context, &p->context);
 
+        kvminithart();
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
