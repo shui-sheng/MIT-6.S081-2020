@@ -311,7 +311,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  //char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -320,13 +320,20 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+    flags = (flags & ~PTE_W) | PTE_COW;
+    *pte = (~(*pte ^ ~PTE_W)) | PTE_COW;
+    //if((mem = kalloc()) == 0)//取消子进程页表内存的分配
+    //  goto err;
+    //memmove(mem, (char*)pa, PGSIZE);
+
+    //直接映射
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
+      //kfree(mem);
       goto err;
     }
+
+     inrefcnt(pa);
   }
   return 0;
 
@@ -355,9 +362,33 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
-
+  if(dstva > MAXVA - len ) return -1;
+  
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+
+    pte_t *pte = walk(pagetable, va0, 0);
+    if(pte == 0) return -1;
+    if(!(PTE_FLAGS(*pte) & PTE_W)){
+      if(!(PTE_FLAGS(*pte) & PTE_COW)){
+        return -1;
+      }
+      uint64 va = va0;
+      uint64 ka = (uint64)kalloc();
+      if(ka == 0) {
+        return -1;
+      } else {
+        uint64 flags = PTE_FLAGS(*pte);
+        flags = flags & ~PTE_COW;
+        uint64 pa = walkaddr(pagetable, va);
+        memmove((void*)ka, (void*)pa, PGSIZE);
+        uvmunmap(pagetable, va, 1, 1);
+        mappages(pagetable, va, 1, ka, flags | PTE_W);
+      }
+
+
+    }
+
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
