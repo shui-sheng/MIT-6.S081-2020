@@ -5,7 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
-
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -302,6 +305,12 @@ fork(void)
 
   np->state = RUNNABLE;
 
+  for(int i = 0; i< MVMA; i++){
+    memmove(&np->vmas[i], &p->vmas[i], sizeof(p->vmas[i]));
+    if(p->vmas[i].fp)
+     filedup(p->vmas[i].fp);
+  }
+
   release(&np->lock);
 
   return pid;
@@ -351,6 +360,9 @@ exit(int status)
       fileclose(f);
       p->ofile[fd] = 0;
     }
+  }
+  for(int i = 0; i <MVMA ;i++){
+    uvmunmap(p->pagetable, p->vmas[i].addr, p->vmas[i].len/PGSIZE, 1);
   }
 
   begin_op();
