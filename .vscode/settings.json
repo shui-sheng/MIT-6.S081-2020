@@ -1,6 +1,7 @@
 {
-    "files.associations": {
-        "file.h": "c",
-        "spinlock.h": "c"
-    }
+  "files.associations": {
+    "file.h": "c",
+    "spinlock.h": "c"
+  },
+  "C_Cpp_Runner.msvcBatchPath": ""
 }
